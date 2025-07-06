@@ -2,6 +2,7 @@ const Poll = require('../models/Poll');
 const Vote = require('../models/Vote');
 const Response = require('../models/Response');
 const { generateSlug } = require('../utils/generateSlug');
+const { raw } = require('express');
 
 // works well
 exports.createPoll = async (req, res) => {
@@ -93,57 +94,109 @@ exports.getMyPolls = async (req, res) => {
 
     const pollIds = polls.map(p => p._id);
 
+    // Get vote count per poll & option (by text)
     const voteCounts = await Vote.aggregate([
       { $match: { poll: { $in: pollIds } } },
-      { $group: { _id: '$poll', count: { $sum: 1 } } }
+      {
+        $group: {
+          _id: { poll: '$poll', option: '$option' }, // option is text
+          count: { $sum: 1 }
+        }
+      }
     ]);
 
-    const countMap = {};
-    voteCounts.forEach(vc => {
-      countMap[vc._id.toString()] = vc.count;
+    // Build a map: { pollId: { optionText: count } }
+    const voteMap = {};
+    voteCounts.forEach(({ _id, count }) => {
+      const pollId = _id.poll.toString();
+      const optionText = _id.option;
+
+      if (!voteMap[pollId]) voteMap[pollId] = {};
+      voteMap[pollId][optionText] = count;
     });
 
-    const enrichedPolls = polls.map(p => ({
-      ...p.toObject(),
-      responseCount: countMap[p._id.toString()] || 0
-    }));
+    // Enrich each poll
+    const enrichedPolls = polls.map(poll => {
+      const pollObj = poll.toObject();
+      const pollId = poll._id.toString();
+      const rawOptions = poll.options[0]?.options || [];
+
+      const optionVotes = voteMap[pollId] || {};
+
+      // New 'voted' field: [{ text, votes }]
+      const voted = rawOptions.map(text => ({
+        text,
+        votes: optionVotes[text] || 0
+      }));
+
+      // Total responses = sum of all option votes
+      const responseCount = voted.reduce((sum, o) => sum + o.votes, 0);
+
+      return {
+        ...pollObj,
+        voted,           // ← add vote counts without modifying raw options
+        responseCount
+      };
+    });
 
     res.json(enrichedPolls);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Failed to fetch user polls' });
   }
 };
 
+
+
+
 // get poll by slug
 exports.getPollBySlug = async (req, res) => {
   const { slug } = req.params;
-  const ip =
-    req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   const userId = req.user?.id || null;
 
   try {
-    const poll = await Poll.findOne({slug: slug});
-
+    const poll = await Poll.findOne({ slug });
     if (!poll || !poll.public) {
       return res.status(404).json({ error: 'Poll not found or is private' });
     }
 
     const hasVoted = await Vote.exists({
-      poll: poll?._id,
-      $or: [
-        { user: userId || null },
-        { ip }
-      ]
+      poll: poll._id,
+      $or: [{ user: userId || null }, { ip }]
     });
+
+    const rawOptions = poll.options[0]?.options || [];
+
+ // Get vote count per poll & option (by option text)
+const voteCounts = await Vote.aggregate([
+  { $match: { poll: poll._id } },
+  { $group: { _id: '$option', count: { $sum: 1 } } } // group by text
+]);
+
+// Build count map using text as key
+const countMap = {};
+voteCounts.forEach(vc => {
+  countMap[vc._id] = vc.count;
+});
+
+// Then map options with votes
+const voted = rawOptions.map(text => ({
+  text,
+  votes: countMap[text] || 0
+}));
+
 
     res.json({
       ...poll.toObject(),
+      voted,
       hasVoted: !!hasVoted
     });
   } catch (error) {
     res.status(500).json({ error: error.message || error });
   }
 };
+
 
 
 // create vote
